@@ -76,7 +76,7 @@ module ccu_fsm
     logic [NoMstPorts-1:0]             initiator_d, initiator_q;
     logic [id_length-1:0]                first_responder;
 
-  logic [1:0][$size(ccu_resp_o.r.data)-1:0]               cd_data;
+  logic [1:0][63:0]         cd_data;
   logic [1:0]               stored_cd_data;
   logic                                                    r_last;
   logic                                                    w_last;
