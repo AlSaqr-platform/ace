@@ -1,6 +1,6 @@
 CAPI=2:
 
-name : planv::ace:0.0.1
+name : planv::ace:0.0.1-pulp
 
 filesets:
   rtl:
@@ -26,7 +26,7 @@ filesets:
       - src/snoop_test.sv
     file_type : systemVerilogSource
     depend :
-      - ">=pulp-platform.org::axi:0.38.0"
+      - ">=pulp-platform.org::axi:0.39.0-beta.2"
   benchs:
     files:
       - test/tb_ace_ccu_pkg.sv

@@ -3,7 +3,10 @@
 
 module ccu_fsm
 #(
-    parameter int  NoMstPorts   = 4,
+    parameter int unsigned DcacheLineWidth = 0,
+    parameter int unsigned AxiDataWidth = 0,
+    parameter int unsigned NoMstPorts = 4,
+    parameter int unsigned SlvAxiIDWidth = 0,
     parameter type mst_req_t    = logic,
     parameter type mst_resp_t   = logic,
     parameter type snoop_req_t  = logic,
@@ -23,7 +26,10 @@ module ccu_fsm
     input  snoop_resp_t [NoMstPorts-1:0] m2s_resp_i
 );
 
-    enum logic [5:0] { 
+    localparam int unsigned DcacheLineWords = DcacheLineWidth / AxiDataWidth;
+    localparam int unsigned MstIdxBits      = $clog2(NoMstPorts);
+
+    enum logic [5:0] {
       IDLE,                      // 0
       DECODE_R,                  // 1
       SEND_INVALID_R,            // 2
@@ -44,7 +50,6 @@ module ccu_fsm
       WRITE_MEM                  // 17
     } state_d, state_q;
 
-    localparam BURST_SIZE = 2-1; //ariane_pkg::DCACHE_LINE_WIDTH/riscv::XLEN-1;
 
     // snoop resoponse valid
     logic [NoMstPorts-1:0]          cr_valid;
@@ -71,22 +76,23 @@ module ccu_fsm
     // snoop response holder
     snoop_resp_t [NoMstPorts-1:0]   m2s_resp_holder;
     // initiating master port
-    localparam id_length = $clog2(NoMstPorts);
-    logic [NoMstPorts-1:0]             initiator_d, initiator_q;
-    logic [id_length-1:0]                first_responder;
+    logic [NoMstPorts-1:0]          initiator_d, initiator_q;
+    logic [MstIdxBits-1:0]          first_responder;
 
-  logic [1:0][$size(ccu_resp_o.r.data)-1:0]               cd_data;
-  logic [1:0]               stored_cd_data;
-  logic                                                    r_last;
-  logic                                                    w_last;
-  logic                                                    r_eot;
-  logic                                                    w_eot;
-  typedef struct packed {
-    logic        waiting_w;
-    logic        waiting_r;
-  } prio_t;
+    logic [DcacheLineWords-1:0][AxiDataWidth-1:0] cd_data;
+    logic [$clog2(DcacheLineWords+1)-1:0]         stored_cd_data;
 
-  prio_t prio_d, prio_q;
+    logic r_last;
+    logic w_last;
+    logic r_eot;
+    logic w_eot;
+
+    typedef struct packed {
+      logic waiting_w;
+      logic waiting_r;
+    } prio_t;
+
+    prio_t prio_d, prio_q;
 
     // ----------------------
     // Current State Block
@@ -122,12 +128,12 @@ module ccu_fsm
                (ccu_req_i.ar_valid & prio_q.waiting_r) |
                (ccu_req_i.ar_valid & !prio_q.waiting_w)) begin
                 state_d = DECODE_R;
-                initiator_d[ccu_req_i.ar.id[$size(ccu_req_i.ar.id)-1:$size(ccu_req_i.ar.id)-id_length]] = 1'b1;
+                initiator_d[ccu_req_i.ar.id[SlvAxiIDWidth+:MstIdxBits]] = 1'b1;
                 prio_d.waiting_w = ccu_req_i.aw_valid;
             end else if((ccu_req_i.aw_valid & !ccu_req_i.ar_valid) |
                         (ccu_req_i.aw_valid & prio_q.waiting_w)) begin
                 state_d = DECODE_W;
-                initiator_d[ccu_req_i.aw.id[$size(ccu_req_i.aw.id)-1:$size(ccu_req_i.aw.id)-id_length]] = 1'b1;
+                initiator_d[ccu_req_i.aw.id[SlvAxiIDWidth+:MstIdxBits]] = 1'b1;
                 prio_d.waiting_r = ccu_req_i.ar_valid;
             end else begin
                 state_d = IDLE;
@@ -139,10 +145,12 @@ module ccu_fsm
         //---------------------
         DECODE_R: begin
             //check read transaction type
-            if(ccu_req_holder.ar.snoop != snoop_pkg::CLEAN_UNIQUE) begin   // check if CleanUnique then send Invalidate
-              state_d = SEND_READ;
-            end else begin
+            if (ccu_req_holder.ar.snoop == snoop_pkg::CLEAN_UNIQUE) begin   // check if CleanUnique then send Invalidate
                 state_d = SEND_INVALID_R;
+            end else if (ccu_req_holder.ar.lock) begin   // AMO LR, invalidate
+                state_d = SEND_INVALID_R;
+            end else begin
+                state_d = SEND_READ;
             end
         end
 
@@ -157,11 +165,15 @@ module ccu_fsm
 
         WAIT_INVALID_R: begin
             // wait for all snoop masters to assert CR valid
-            if ((cr_valid == '1) && (ccu_req_i.r_ready )) begin
+            if ((cr_valid == '1) && (ccu_req_i.r_ready || ccu_req_holder.ar.lock)) begin
                 if(|(data_available & ~response_error)) begin
                     state_d = SEND_AXI_REQ_WRITE_BACK_R;
                 end else begin
-                    state_d = IDLE;
+                    if (ccu_req_holder.ar.lock) begin   // AMO LR, read memory
+                        state_d = SEND_AXI_REQ_R;
+                    end else begin
+                        state_d = IDLE;
+                    end
                 end
             end else begin
                 state_d = WAIT_INVALID_R;
@@ -180,7 +192,11 @@ module ccu_fsm
         WRITE_BACK_MEM_R: begin
             // wait for responding slave to send b_valid
             if((ccu_resp_i.b_valid && ccu_req_o.b_ready)) begin
-                state_d = IDLE;
+                if (ccu_req_holder.ar.lock) begin   // AMO LR, read memory
+                    state_d = SEND_AXI_REQ_R;
+                end else begin
+                    state_d = IDLE;
+                end
             end else begin
                 state_d = WRITE_BACK_MEM_R;
             end
@@ -349,7 +365,7 @@ module ccu_fsm
             for (int unsigned n = 0; n < NoMstPorts; n = n + 1) begin
                 s2m_req_o[n].ac.addr   =   ccu_req_holder.ar.addr;
                 s2m_req_o[n].ac.prot   =   ccu_req_holder.ar.prot;
-                s2m_req_o[n].ac.snoop  =   'b1001;
+                s2m_req_o[n].ac.snoop  =   snoop_pkg::CLEAN_INVALID;
                 s2m_req_o[n].ac_valid  =   !ac_ready[n];
             end
         end
@@ -361,9 +377,9 @@ module ccu_fsm
 
         WAIT_INVALID_R: begin
             for (int unsigned n = 0; n < NoMstPorts; n = n + 1)
-              s2m_req_o[n].cr_ready  =   !cr_valid[n]; //'b1;
+                s2m_req_o[n].cr_ready  =   !cr_valid[n]; //'b1;
 
-            if (cr_valid == '1) begin
+            if ((cr_valid == '1) && (!ccu_req_holder.ar.lock)) begin
                 ccu_resp_o.r        =   '0;
                 ccu_resp_o.r.id     =   ccu_req_holder.ar.id;
                 ccu_resp_o.r.last   =   'b1;
@@ -403,8 +419,8 @@ module ccu_fsm
             ccu_req_o.aw.addr[3:0] = 4'b0; // writeback is always full cache line
             ccu_req_o.aw.size      = 2'b11;
             ccu_req_o.aw.burst     = axi_pkg::BURST_INCR; // Use BURST_INCR for AXI regular transaction
-            ccu_req_o.aw.id        = ccu_req_holder.ar.id;
-            ccu_req_o.aw.len       = BURST_SIZE; // number of bursts to do
+            ccu_req_o.aw.id        = {first_responder, ccu_req_holder.ar.id[SlvAxiIDWidth-1:0]}; // It should be visible this data originates from the responder, important e.g. for AMO operations
+            ccu_req_o.aw.len       = DcacheLineWords-1;
             // WRITEBACK
             ccu_req_o.aw.domain    = 2'b00;
             ccu_req_o.aw.snoop     = 3'b011;
@@ -444,9 +460,9 @@ module ccu_fsm
 
         SEND_INVALID_W:begin
             for (int unsigned n = 0; n < NoMstPorts; n = n + 1) begin
-                s2m_req_o[n].ac.addr  = ccu_req_holder.aw.addr; // <----- Should use ccu_req_holder.aw?
-                s2m_req_o[n].ac.prot  = ccu_req_holder.aw.prot; // <----- Should use ccu_req_holder.aw?
-                s2m_req_o[n].ac.snoop = 'b1001;
+                s2m_req_o[n].ac.addr  = ccu_req_holder.aw.addr;
+                s2m_req_o[n].ac.prot  = ccu_req_holder.aw.prot;
+                s2m_req_o[n].ac.snoop = snoop_pkg::CLEAN_INVALID;
                 s2m_req_o[n].ac_valid = !ac_ready[n];
             end
         end
@@ -459,8 +475,8 @@ module ccu_fsm
             ccu_req_o.aw.addr[3:0] = 4'b0; // writeback is always full cache line
             ccu_req_o.aw.size      = 2'b11;
             ccu_req_o.aw.burst     = axi_pkg::BURST_INCR; // Use BURST_INCR for AXI regular transaction
-            ccu_req_o.aw.id        = ccu_req_holder.aw.id;
-            ccu_req_o.aw.len       = BURST_SIZE; // number of bursts to do
+            ccu_req_o.aw.id        = {first_responder, ccu_req_holder.aw.id[SlvAxiIDWidth-1:0]}; // It should be visible this data originates from the responder, important e.g. for AMO operations
+            ccu_req_o.aw.len       = DcacheLineWords-1;
             // WRITEBACK
             ccu_req_o.aw.domain    = 2'b00;
             ccu_req_o.aw.snoop     = 3'b011;
@@ -506,14 +522,14 @@ module ccu_fsm
                     ((ccu_req_i.ar_valid & !ccu_req_i.aw_valid) |
                      (ccu_req_i.ar_valid & prio_q.waiting_r) |
                      (ccu_req_i.ar_valid & !prio_q.waiting_w))) begin
-            ccu_req_holder.ar 	    <=  ccu_req_i.ar;
+            ccu_req_holder.ar       <=  ccu_req_i.ar;
             ccu_req_holder.ar_valid <=  ccu_req_i.ar_valid;
-            ccu_req_holder.r_ready 	<=  ccu_req_i.r_ready;
+            ccu_req_holder.r_ready  <=  ccu_req_i.r_ready;
 
         end  else if(state_q == IDLE &&
                     ((ccu_req_i.aw_valid & !ccu_req_i.ar_valid) |
                      (ccu_req_i.aw_valid & prio_q.waiting_w))) begin
-            ccu_req_holder.aw 	    <=  ccu_req_i.aw;
+            ccu_req_holder.aw       <=  ccu_req_i.aw;
             ccu_req_holder.aw_valid <=  ccu_req_i.aw_valid;
         end
     end
@@ -570,7 +586,7 @@ module ccu_fsm
         if (!snoop_resp_found) begin
           for (int i = 0; i < NoMstPorts; i = i + 1) begin
             if(m2s_resp_i[i].cr_valid & s2m_req_o[i].cr_ready & m2s_resp_i[i].cr_resp.dataTransfer & !m2s_resp_i[i].cr_resp.error) begin
-              first_responder <= i[id_length-1:0];
+              first_responder <= i[MstIdxBits-1:0];
               snoop_resp_found <= 1'b1;
               break;
             end
@@ -670,5 +686,16 @@ module ccu_fsm
       end
     end
   end
+
+  `ifndef VERILATOR
+  // pragma translate_off
+  initial begin
+    a_dcache_line_words : assert (DcacheLineWords == 2) else
+        $error("The ccu_fsm module is currently hardcoded to only support DcacheLineWidth = 2 * AxiDataWidth");
+  end
+  // pragma translate_on
+  `endif
+
+
 
 endmodule
