@@ -29,25 +29,23 @@ module ccu_fsm
     localparam int unsigned DcacheLineWords = DcacheLineWidth / AxiDataWidth;
     localparam int unsigned MstIdxBits      = $clog2(NoMstPorts);
 
-    enum logic [5:0] {
+    enum logic [3:0] {
       IDLE,                      // 0
-      DECODE_R,                  // 1
-      SEND_INVALID_R,            // 2
-      WAIT_INVALID_R,            // 3
-      SEND_AXI_REQ_WRITE_BACK_R, // 4
-      WRITE_BACK_MEM_R,          // 5
-      SEND_READ,                 // 6
-      WAIT_RESP_R,               // 7
-      READ_SNP_DATA,             // 8
-      SEND_AXI_REQ_R,            // 9
-      READ_MEM,                  // 10
-      DECODE_W,                  // 11
-      SEND_INVALID_W,            // 12
-      WAIT_INVALID_W,            // 13
-      SEND_AXI_REQ_WRITE_BACK_W, // 14
-      WRITE_BACK_MEM_W,          // 15
-      SEND_AXI_REQ_W,            // 16
-      WRITE_MEM                  // 17
+      SEND_INVALID_R,            // 1
+      WAIT_INVALID_R,            // 2
+      SEND_AXI_REQ_WRITE_BACK_R, // 3
+      WRITE_BACK_MEM_R,          // 4
+      SEND_READ,                 // 5
+      WAIT_RESP_R,               // 6
+      READ_SNP_DATA,             // 7
+      SEND_AXI_REQ_R,            // 8
+      READ_MEM,                  // 9
+      SEND_INVALID_W,            // 10
+      WAIT_INVALID_W,            // 11
+      SEND_AXI_REQ_WRITE_BACK_W, // 12
+      WRITE_BACK_MEM_W,          // 13
+      SEND_AXI_REQ_W,            // 14
+      WRITE_MEM                  // 15
     } state_d, state_q;
 
 
@@ -168,11 +166,11 @@ module ccu_fsm
             prio_d = '0;
             //  wait for incoming valid request from master
             if(decode_r) begin
-                state_d = DECODE_R;
+                state_d = send_invalid_r ? SEND_INVALID_R : SEND_READ;
                 initiator_d[ccu_req_i.ar.id[SlvAxiIDWidth+:MstIdxBits]] = 1'b1;
                 prio_d.waiting_w = ccu_req_i.aw_valid;
             end else if(decode_w) begin
-                state_d = DECODE_W;
+                state_d = SEND_INVALID_W;
                 initiator_d[ccu_req_i.aw.id[SlvAxiIDWidth+:MstIdxBits]] = 1'b1;
                 prio_d.waiting_r = ccu_req_i.ar_valid;
             end else begin
@@ -183,16 +181,6 @@ module ccu_fsm
         //---------------------
         //---- Read Branch ----
         //---------------------
-        DECODE_R: begin
-            //check read transaction type
-            if (ccu_req_holder.ar.snoop == snoop_pkg::CLEAN_UNIQUE) begin   // check if CleanUnique then send Invalidate
-                state_d = SEND_INVALID_R;
-            end else if (ccu_req_holder.ar.lock) begin   // AMO LR, invalidate
-                state_d = SEND_INVALID_R;
-            end else begin
-                state_d = SEND_READ;
-            end
-        end
 
         SEND_INVALID_R: begin
             // wait for all snoop masters to assert AC ready
@@ -297,10 +285,6 @@ module ccu_fsm
         //---- Write Branch ---
         //---------------------
 
-        DECODE_W: begin
-            state_d = SEND_INVALID_W;
-        end
-
         SEND_INVALID_W: begin
             // wait for all snoop masters to assert AC ready
             if (ac_ready != '1) begin
@@ -382,15 +366,14 @@ module ccu_fsm
 
         case(state_q)
         IDLE: begin
-
+          ccu_resp_o.ar_ready = prio_r;
+          ccu_resp_o.aw_ready = prio_w;
         end
 
         //---------------------
         //---- Read Branch ----
         //---------------------
-        DECODE_R:begin
-            ccu_resp_o.ar_ready =   'b1;
-        end
+
         SEND_READ: begin
             // send request to snooping masters
             for (int unsigned n = 0; n < NoMstPorts; n = n + 1) begin
@@ -494,9 +477,6 @@ module ccu_fsm
         //---------------------
         //---- Write Branch ---
         //---------------------
-        DECODE_W: begin
-            ccu_resp_o.aw_ready =   'b1;
-        end
 
         SEND_INVALID_W:begin
             for (int unsigned n = 0; n < NoMstPorts; n = n + 1) begin
@@ -574,8 +554,8 @@ module ccu_fsm
       if(!rst_ni) begin
         ac_ready         <= '0;
         ac_valid         <= '0;
-      end else if(state_q == DECODE_R || state_q == DECODE_W) begin
-        ac_ready <= initiator_q;
+      end else if(state_q == IDLE && (decode_r || decode_w)) begin
+        ac_ready <= initiator_d;
       end else if(state_q == SEND_READ || state_q == SEND_INVALID_R || state_q == SEND_INVALID_W) begin
         for (int i = 0; i < NoMstPorts; i = i + 1) begin
           ac_ready[i] <= ac_ready[i] | ac_handshake[i];
