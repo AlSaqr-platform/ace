@@ -94,6 +94,49 @@ module ccu_fsm
 
     prio_t prio_d, prio_q;
 
+    // ---------------------
+    // Useful signals
+    //----------------------
+    logic prio_r, prio_w;
+    logic decode_r, decode_w;
+
+    assign prio_r    = !ccu_req_i.aw_valid | prio_q.waiting_r | !prio_q.waiting_w;
+    assign decode_r = ccu_req_i.ar_valid & prio_r;
+
+    assign prio_w    = !ccu_req_i.ar_valid | prio_q.waiting_w;
+    assign decode_w  = ccu_req_i.aw_valid & prio_w;
+
+    logic slv_ar_handshake, slv_aw_handshake, slv_r_handshake;
+    assign slv_ar_handshake = ccu_req_i.ar_valid & ccu_resp_o.ar_ready;
+    assign slv_aw_handshake = ccu_req_i.aw_valid & ccu_resp_o.aw_ready;
+    assign slv_r_handshake  = ccu_resp_o.r_valid & ccu_req_i.r_ready;
+
+    logic mst_w_handshake, mst_b_handshake;
+    assign mst_w_handshake = ccu_req_o.w_valid & ccu_resp_i.w_ready;
+    assign mst_b_handshake = ccu_resp_i.b_valid & ccu_req_o.b_ready;
+
+    logic send_invalid_r;
+    assign send_invalid_r = ccu_req_i.ar.snoop == snoop_pkg::CLEAN_UNIQUE || ccu_req_i.ar.lock;
+
+    logic [NoMstPorts-1:0] ac_handshake;
+    for (genvar i = 0; i < NoMstPorts; i = i + 1) begin
+      assign ac_handshake[i] = (m2s_resp_i[i].ac_ready & s2m_req_o[i].ac_valid);
+    end
+
+    logic [NoMstPorts-1:0] cr_handshake;
+    for (genvar i = 0; i < NoMstPorts; i = i + 1) begin
+      assign cr_handshake[i] = (m2s_resp_i[i].cr_valid & s2m_req_o[i].cr_ready);
+    end
+
+    snoop_req_t  responder_req;
+    snoop_resp_t responder_resp;
+    logic responder_cd_handshake;
+    logic cd_valid_data;
+
+    assign responder_req  = s2m_req_o[first_responder];
+    assign responder_resp = m2s_resp_i[first_responder];
+    assign responder_cd_handshake = responder_resp.cd_valid & responder_req.cd_ready;
+
     // ----------------------
     // Current State Block
     // ----------------------
@@ -124,14 +167,11 @@ module ccu_fsm
             initiator_d = '0;
             prio_d = '0;
             //  wait for incoming valid request from master
-            if((ccu_req_i.ar_valid & !ccu_req_i.aw_valid) |
-               (ccu_req_i.ar_valid & prio_q.waiting_r) |
-               (ccu_req_i.ar_valid & !prio_q.waiting_w)) begin
+            if(decode_r) begin
                 state_d = DECODE_R;
                 initiator_d[ccu_req_i.ar.id[SlvAxiIDWidth+:MstIdxBits]] = 1'b1;
                 prio_d.waiting_w = ccu_req_i.aw_valid;
-            end else if((ccu_req_i.aw_valid & !ccu_req_i.ar_valid) |
-                        (ccu_req_i.aw_valid & prio_q.waiting_w)) begin
+            end else if(decode_w) begin
                 state_d = DECODE_W;
                 initiator_d[ccu_req_i.aw.id[SlvAxiIDWidth+:MstIdxBits]] = 1'b1;
                 prio_d.waiting_r = ccu_req_i.ar_valid;
@@ -191,7 +231,7 @@ module ccu_fsm
 
         WRITE_BACK_MEM_R: begin
             // wait for responding slave to send b_valid
-            if((ccu_resp_i.b_valid && ccu_req_o.b_ready)) begin
+            if(mst_b_handshake) begin
                 if (ccu_req_holder.ar.lock) begin   // AMO LR, read memory
                     state_d = SEND_AXI_REQ_R;
                 end else begin
@@ -292,7 +332,7 @@ module ccu_fsm
 
         WRITE_BACK_MEM_W: begin
             // wait for responding slave to send b_valid
-            if((ccu_resp_i.b_valid && ccu_req_o.b_ready)) begin
+            if(mst_b_handshake) begin
                 state_d = SEND_AXI_REQ_W;
             end else begin
                 state_d = WRITE_BACK_MEM_W;
@@ -518,17 +558,12 @@ module ccu_fsm
     always_ff @(posedge clk_i , negedge rst_ni) begin
         if(!rst_ni) begin
             ccu_req_holder <= '0;
-        end else if(state_q == IDLE &&
-                    ((ccu_req_i.ar_valid & !ccu_req_i.aw_valid) |
-                     (ccu_req_i.ar_valid & prio_q.waiting_r) |
-                     (ccu_req_i.ar_valid & !prio_q.waiting_w))) begin
+        end else if(state_q == IDLE && decode_r) begin
             ccu_req_holder.ar       <=  ccu_req_i.ar;
             ccu_req_holder.ar_valid <=  ccu_req_i.ar_valid;
             ccu_req_holder.r_ready  <=  ccu_req_i.r_ready;
 
-        end  else if(state_q == IDLE &&
-                    ((ccu_req_i.aw_valid & !ccu_req_i.ar_valid) |
-                     (ccu_req_i.aw_valid & prio_q.waiting_w))) begin
+        end  else if(state_q == IDLE && decode_w) begin
             ccu_req_holder.aw       <=  ccu_req_i.aw;
             ccu_req_holder.aw_valid <=  ccu_req_i.aw_valid;
         end
@@ -543,8 +578,8 @@ module ccu_fsm
         ac_ready <= initiator_q;
       end else if(state_q == SEND_READ || state_q == SEND_INVALID_R || state_q == SEND_INVALID_W) begin
         for (int i = 0; i < NoMstPorts; i = i + 1) begin
-          ac_ready[i] <= ac_ready[i] | (m2s_resp_i[i].ac_ready & s2m_req_o[i].ac_valid);
-          ac_valid[i] <= ac_valid[i] | (m2s_resp_i[i].ac_ready & s2m_req_o[i].ac_valid);
+          ac_ready[i] <= ac_ready[i] | ac_handshake[i];
+          ac_valid[i] <= ac_valid[i] | ac_handshake[i];
         end
       end else begin
         ac_ready         <= '0;
@@ -575,7 +610,7 @@ module ccu_fsm
         cr_valid <= initiator_q;
       end else begin
         for (int i = 0; i < NoMstPorts; i = i + 1) begin
-          if(m2s_resp_i[i].cr_valid & s2m_req_o[i].cr_ready) begin
+          if(cr_handshake[i]) begin
             cr_valid[i]         <=   cr_valid[i] | 1'b1;
             data_available[i]   <=   m2s_resp_i[i].cr_resp.dataTransfer;
             shared[i]           <=   m2s_resp_i[i].cr_resp.isShared;
@@ -585,7 +620,7 @@ module ccu_fsm
         end
         if (!snoop_resp_found) begin
           for (int i = 0; i < NoMstPorts; i = i + 1) begin
-            if(m2s_resp_i[i].cr_valid & s2m_req_o[i].cr_ready & m2s_resp_i[i].cr_resp.dataTransfer & !m2s_resp_i[i].cr_resp.error) begin
+            if(cr_handshake[i] & m2s_resp_i[i].cr_resp.dataTransfer & !m2s_resp_i[i].cr_resp.error) begin
               first_responder <= i[MstIdxBits-1:0];
               snoop_resp_found <= 1'b1;
               break;
@@ -623,12 +658,12 @@ module ccu_fsm
                 data_received[i] <= '0;
                 m2s_resp_holder  <= '0;
               end
-              if (m2s_resp_i[first_responder].cd_valid & s2m_req_o[first_responder].cd_ready) begin
-                cd_data[m2s_resp_i[first_responder].cd.last] <= m2s_resp_i[first_responder].cd.data;
+              if (responder_cd_handshake) begin
+                cd_data[responder_resp.cd.last] <= responder_resp.cd.data;
               end
-              if (s2m_req_o[first_responder].cd_ready & m2s_resp_i[first_responder].cd_valid & !(ccu_resp_o.r_valid & ccu_req_i.r_ready)) begin
+              if (responder_cd_handshake & !slv_r_handshake) begin
                 stored_cd_data <= stored_cd_data + 1;
-              end else if(ccu_resp_o.r_valid & ccu_req_i.r_ready & !(s2m_req_o[first_responder].cd_ready & m2s_resp_i[first_responder].cd_valid)) begin
+              end else if(slv_r_handshake & !(responder_cd_handshake)) begin
                 stored_cd_data <= stored_cd_data - 1;
               end
             end else if (state_q == WRITE_BACK_MEM_R || state_q == WRITE_BACK_MEM_W) begin
@@ -641,12 +676,12 @@ module ccu_fsm
                 data_received[i] <= '0;
                 m2s_resp_holder  <= '0;
               end
-              if (m2s_resp_i[first_responder].cd_valid & s2m_req_o[first_responder].cd_ready) begin
-                cd_data[m2s_resp_i[first_responder].cd.last] <= m2s_resp_i[first_responder].cd.data;
+              if (responder_cd_handshake) begin
+                cd_data[responder_resp.cd.last] <= responder_resp.cd.data;
               end
-              if (s2m_req_o[first_responder].cd_ready & m2s_resp_i[first_responder].cd_valid & !(ccu_req_o.w_valid & ccu_resp_i.w_ready)) begin
+              if (responder_cd_handshake & !mst_w_handshake) begin
                 stored_cd_data <= stored_cd_data + 1;
-              end else if(ccu_req_o.w_valid & ccu_resp_i.w_ready & !(s2m_req_o[first_responder].cd_ready & m2s_resp_i[first_responder].cd_valid)) begin
+              end else if(mst_w_handshake & !(responder_cd_handshake)) begin
                 stored_cd_data <= stored_cd_data - 1;
               end
             end
@@ -663,7 +698,7 @@ module ccu_fsm
       if(state_q == IDLE) begin
         r_last <= 1'b0;
         r_eot  <= 1'b0;
-      end else if (ccu_req_i.r_ready & ccu_resp_o.r_valid) begin
+      end else if (slv_r_handshake) begin
         r_last <= !r_last;
         if (ccu_resp_o.r.last)
           r_eot <= 1'b1;
@@ -679,7 +714,7 @@ module ccu_fsm
       if(state_q == IDLE) begin
         w_last <= 1'b0;
         w_eot  <= 1'b0;
-      end else if (ccu_resp_i.w_ready & ccu_req_o.w_valid) begin
+      end else if (mst_w_handshake) begin
         w_last <= !w_last;
         if (w_last)
           w_eot <= 1'b1;
