@@ -51,10 +51,8 @@ module ccu_fsm
 
     // snoop resoponse valid
     logic [NoMstPorts-1:0]          cr_valid;
-    // snoop channel ac valid
-    logic [NoMstPorts-1:0]          ac_valid;
     // snoop channel ac ready
-    logic [NoMstPorts-1:0]          ac_ready;
+    logic [NoMstPorts-1:0]          ac_handshake_holder_d, ac_handshake_holder_q;
     // snoop channel cd last
     logic [NoMstPorts-1:0]          cd_last;
     // check for availablilty of data
@@ -184,7 +182,7 @@ module ccu_fsm
 
         SEND_INVALID_R: begin
             // wait for all snoop masters to assert AC ready
-            if (ac_ready != '1) begin
+            if (ac_handshake_holder_d != '1) begin
                 state_d = SEND_INVALID_R;
             end else begin
                 state_d = WAIT_INVALID_R;
@@ -232,7 +230,7 @@ module ccu_fsm
 
         SEND_READ: begin
             // wait for all snoop masters to de-assert AC ready
-            if (ac_ready != '1) begin
+            if (ac_handshake_holder_d != '1) begin
                 state_d = SEND_READ;
             end else begin
                 state_d = WAIT_RESP_R;
@@ -287,7 +285,7 @@ module ccu_fsm
 
         SEND_INVALID_W: begin
             // wait for all snoop masters to assert AC ready
-            if (ac_ready != '1) begin
+            if (ac_handshake_holder_d != '1) begin
                 state_d = SEND_INVALID_W;
             end else begin
                 state_d = WAIT_INVALID_W;
@@ -380,7 +378,7 @@ module ccu_fsm
                 s2m_req_o[n].ac.addr   =   ccu_req_holder.ar.addr;
                 s2m_req_o[n].ac.prot   =   ccu_req_holder.ar.prot;
                 s2m_req_o[n].ac.snoop  =   ccu_req_holder.ar.snoop;
-                s2m_req_o[n].ac_valid  =   !ac_ready[n];
+                s2m_req_o[n].ac_valid  =   !ac_handshake_holder_q[n];
             end
         end
 
@@ -389,7 +387,7 @@ module ccu_fsm
                 s2m_req_o[n].ac.addr   =   ccu_req_holder.ar.addr;
                 s2m_req_o[n].ac.prot   =   ccu_req_holder.ar.prot;
                 s2m_req_o[n].ac.snoop  =   snoop_pkg::CLEAN_INVALID;
-                s2m_req_o[n].ac_valid  =   !ac_ready[n];
+                s2m_req_o[n].ac_valid  =   !ac_handshake_holder_q[n];
             end
         end
 
@@ -483,7 +481,7 @@ module ccu_fsm
                 s2m_req_o[n].ac.addr  = ccu_req_holder.aw.addr;
                 s2m_req_o[n].ac.prot  = ccu_req_holder.aw.prot;
                 s2m_req_o[n].ac.snoop = snoop_pkg::CLEAN_INVALID;
-                s2m_req_o[n].ac_valid = !ac_ready[n];
+                s2m_req_o[n].ac_valid = !ac_handshake_holder_q[n];
             end
         end
 
@@ -549,23 +547,20 @@ module ccu_fsm
         end
     end
 
-    // Hold snoop AC_ready
+    // Hold snoop AC handshake
     always_ff @ (posedge clk_i, negedge rst_ni) begin
       if(!rst_ni) begin
-        ac_ready         <= '0;
-        ac_valid         <= '0;
-      end else if(state_q == IDLE && (decode_r || decode_w)) begin
-        ac_ready <= initiator_d;
-      end else if(state_q == SEND_READ || state_q == SEND_INVALID_R || state_q == SEND_INVALID_W) begin
-        for (int i = 0; i < NoMstPorts; i = i + 1) begin
-          ac_ready[i] <= ac_ready[i] | ac_handshake[i];
-          ac_valid[i] <= ac_valid[i] | ac_handshake[i];
-        end
+        ac_handshake_holder_q <= '0;
+      end else if(state_q == IDLE && (slv_ar_handshake || slv_aw_handshake)) begin
+        ac_handshake_holder_q <= initiator_d;
+      end else if(state_q inside {SEND_READ, SEND_INVALID_R, SEND_INVALID_W}) begin
+        ac_handshake_holder_q <= ac_handshake_holder_d;
       end else begin
-        ac_ready         <= '0;
-        ac_valid         <= '0;
+        ac_handshake_holder_q <= '0;
       end
     end
+
+    assign ac_handshake_holder_d = ac_handshake | ac_handshake_holder_q;
 
     // Hold snoop CR
     always_ff @ (posedge clk_i, negedge rst_ni) begin
