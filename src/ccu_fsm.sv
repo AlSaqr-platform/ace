@@ -52,7 +52,7 @@ module ccu_fsm
     // snoop resoponse valid
     logic [NoMstPorts-1:0]          cr_valid;
     // snoop channel ac ready
-    logic [NoMstPorts-1:0]          ac_handshake_holder_d, ac_handshake_holder_q;
+    logic [NoMstPorts-1:0]          ac_handshake_holder, ac_handshake_holder_q;
     // snoop channel cd last
     logic [NoMstPorts-1:0]          cd_last;
     // check for availablilty of data
@@ -182,7 +182,7 @@ module ccu_fsm
 
         SEND_INVALID_R: begin
             // wait for all snoop masters to assert AC ready
-            if (ac_handshake_holder_d != '1) begin
+            if (ac_handshake_holder != '1) begin
                 state_d = SEND_INVALID_R;
             end else begin
                 state_d = WAIT_INVALID_R;
@@ -230,7 +230,7 @@ module ccu_fsm
 
         SEND_READ: begin
             // wait for all snoop masters to de-assert AC ready
-            if (ac_handshake_holder_d != '1) begin
+            if (ac_handshake_holder != '1) begin
                 state_d = SEND_READ;
             end else begin
                 state_d = WAIT_RESP_R;
@@ -285,7 +285,7 @@ module ccu_fsm
 
         SEND_INVALID_W: begin
             // wait for all snoop masters to assert AC ready
-            if (ac_handshake_holder_d != '1) begin
+            if (ac_handshake_holder != '1) begin
                 state_d = SEND_INVALID_W;
             end else begin
                 state_d = WAIT_INVALID_W;
@@ -548,19 +548,29 @@ module ccu_fsm
     end
 
     // Hold snoop AC handshake
-    always_ff @ (posedge clk_i, negedge rst_ni) begin
-      if(!rst_ni) begin
-        ac_handshake_holder_q <= '0;
-      end else if(state_q == IDLE && (slv_ar_handshake || slv_aw_handshake)) begin
-        ac_handshake_holder_q <= initiator_d;
-      end else if(state_q inside {SEND_READ, SEND_INVALID_R, SEND_INVALID_W}) begin
-        ac_handshake_holder_q <= ac_handshake_holder_d;
-      end else begin
-        ac_handshake_holder_q <= '0;
+    for (genvar i = 0; i < NoMstPorts; i = i + 1) begin
+      always_ff @ (posedge clk_i, negedge rst_ni) begin
+        if(!rst_ni) begin
+          ac_handshake_holder_q[i] <= '0;
+        end else begin
+          case (state_q)
+            IDLE: begin
+              if (slv_ar_handshake || slv_aw_handshake)
+                ac_handshake_holder_q[i] <= initiator_d[i];
+            end
+            SEND_READ, SEND_INVALID_R, SEND_INVALID_W: begin
+              if (ac_handshake[i])
+                ac_handshake_holder_q[i] <= 1'b1;
+            end
+            default: begin
+              ac_handshake_holder_q[i] <= 0;
+            end
+          endcase
+        end
       end
     end
 
-    assign ac_handshake_holder_d = ac_handshake | ac_handshake_holder_q;
+    assign ac_handshake_holder = ac_handshake | ac_handshake_holder_q;
 
     // Hold snoop CR
     always_ff @ (posedge clk_i, negedge rst_ni) begin
